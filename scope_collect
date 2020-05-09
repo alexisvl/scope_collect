@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+
+# Script to receive screenshots from a Tektronix TDS460A (or similar) over
+# RS232 and convert them.
+#
+# Only TIFF has full support. It is converted automatically to PNG, and its
+# beginning and end can be detected in a stream, so there is no need to wait
+# between screenshots.
+#
+# BMP is fucked up on this device and there is no way to directly detect the
+# end without fully decoding, and I can't be arsed to implement that.
+#
+# Anything but TIFF is left alone.
+#
+# Copyright (C) 2020 Alexis Lockwood.
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <http://www.gnu.org/licenses/>.
+
+import serial
+import os
+import shutil
+import sys
+import time
+import subprocess
+import struct
+import logging
+import pwd
+
+logging.getLogger().setLevel(logging.DEBUG)
+
+# We can't parse the TIFF directly to get its size (I don't think), but this
+# scope usually (see next constant) ends them with this string.
+#
+# The TIFF format DOES NOT GUARANTEE THIS, but this scope does it.
+TIFF_TAIL = b"TIFF Driver 1.0\0"
+
+# If emitting screenshots in rapid succession, sometimes the tail is omitted.
+# This is even less theoretically reliable, but again, does work:
+TIFF_HEAD = b"MM\x00\x2a\x00\x00\x96\x08"
+
+# Whether to use raspi stuff. If false, this should run on anything with a
+# serial port and imagemagick.
+USE_RPI = True
+
+if USE_RPI:
+    import gpiozero
+    buzzer = gpiozero.TonalBuzzer(12)
+    led_receiving = gpiozero.LED(21)
+    led_success = gpiozero.LED(20)
+    led_failure = gpiozero.LED(16)
+else:
+    class fakeled:
+        def on(self):
+            pass
+        def off(self):
+            pass
+    led_receiving = fakeled()
+    led_success = fakeled()
+    led_failure = fakeled()
+
+serial_config = {
+    "port": "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0",
+    "baudrate": 19200,
+    "parity": serial.PARITY_EVEN,
+    "timeout": 0.25,
+}
+
+file_config = {
+    "path": "/share/scope",
+    "file_pre": "scope-%Y%m%d-%H%M%S", # will prefix with file type
+    "file_post": "scope-%Y%m%d-%H%M%S", # only bitmaps converted
+    "convert_to": "png", # File extension, passed to imagemagick to guess the format
+    "chunksize": 128,
+    "user": "alex",
+    "group": "users",
+    "mode": 0o644,
+    "leave_original": False,
+    "convert_user": "nobody", # optional
+}
+
+# Timeout to detect the end of a file. This is different from
+# serial_config["timeout"] to ensure file end is detected quickly
+# in the cases where it can be done by content rather than time.
+overall_timeout = 4.
+
+def success_beep():
+    logging.info("success beep")
+    if not USE_RPI:
+        return
+    try:
+        buzzer.play(440.0)
+        time.sleep(0.1)
+        buzzer.play(880.0)
+        time.sleep(0.2)
+    finally:
+        buzzer.stop()
+
+def failure_beep():
+    logging.info("failure beep")
+    if not USE_RPI:
+        return
+    try:
+        buzzer.play(660.0)
+        time.sleep(0.15)
+        buzzer.play(330.0)
+        time.sleep(0.15)
+        buzzer.play(220.0)
+        time.sleep(0.3)
+    finally:
+        buzzer.stop()
+
+def start_beep():
+    logging.info("start beep")
+    if not USE_RPI:
+        return
+    try:
+        buzzer.play(220.0)
+        time.sleep(0.075)
+        buzzer.stop()
+        time.sleep(0.025)
+        buzzer.play(220.0)
+        time.sleep(0.125)
+    finally:
+        buzzer.stop()
+
+def identify_type(data):
+    if data.startswith(b"%!PS"):
+        ty = "eps"
+    elif data.startswith(b"\x0a\x05\x01"):
+        ty = "pcx"
+    elif data.startswith(b"BM"):
+        ty = "bmp"
+    elif data.startswith(b"MM"):
+        ty = "tiff"
+    else:
+        ty = "bin"
+
+    logging.info(f"identified type as: {ty}")
+    logging.info(f"starts with: {data[:10]!r}")
+    return ty
+
+def data_complete(buf, ty):
+    if ty != "tiff":
+        return False
+    else:
+        complete = TIFF_TAIL in buf
+        if complete:
+            logging.info(f"found TIFF_TAIL")
+        return complete
+
+def get_first_image(buf, ty):
+    """Return the first image file in the buffer, and the rest of the buffer"""
+
+    if ty != "tiff":
+        return buf, b''
+    elif TIFF_HEAD in buf[1:]:
+        end = buf[1:].index(TIFF_HEAD) + 1
+        return buf[:end], buf[end:]
+    elif TIFF_TAIL in buf:
+        end = buf.index(TIFF_TAIL) + len(TIFF_TAIL)
+        return buf[:end], buf[end:]
+    else:
+        return buf, b''
+
+def do_conversion(image_data, ty, start_time):
+    fn_pre = os.path.join(
+        os.path.expandvars(file_config["path"]),
+        time.strftime(file_config["file_pre"], start_time) + "." + ty
+    )
+
+    fn_post = os.path.join(
+        os.path.expandvars(file_config["path"]),
+        time.strftime(file_config["file_pre"], start_time)
+            + "." + file_config["convert_to"]
+    )
+
+    logging.info(f"saving {len(image_data)} bytes")
+    with open(fn_pre, "wb") as f:
+        f.write(image_data)
+        f.flush()
+    logging.info(f"saved file to {fn_pre}")
+
+    if ty == "tiff":
+        fn = fn_post
+        with open(fn, "wb") as f:
+            pass
+
+        os.chmod(fn_pre, 0o644)
+        os.chmod(fn_post, 0o644)
+        shutil.chown(fn_post, file_config["convert_user"])
+
+        if "convert_user" in file_config:
+            logging.info(f"will setuid/setgid to {file_config['convert_user']}")
+            userinfo = pwd.getpwnam(file_config["convert_user"])
+
+            def preexec_fn():
+                os.setgid(userinfo.pw_gid)
+                os.setuid(userinfo.pw_uid)
+        else:
+            def preexec_fn():
+                pass
+
+        logging.info("launching imagemagick")
+        sp = subprocess.run(["convert", fn_pre, fn], preexec_fn=preexec_fn)
+        led_receiving.off()
+
+        if sp.returncode == 0:
+            logging.info("converted")
+            led_success.on()
+            success_beep()
+            time.sleep(2)
+            led_success.off()
+            if not file_config["leave_original"]:
+                logging.info("removing original file")
+                os.unlink(fn_pre)
+        else:
+            logging.warning(f"conversion failed: rc = {sp.returncode}")
+            led_failure.on()
+            failure_beep()
+            time.sleep(2)
+            led_failure.off()
+            os.unlink(fn_post)
+            fn = fn_pre
+    else:
+        logging.info("not converting this file type")
+        led_receiving.off()
+        fn = fn_pre
+        led_success.on()
+        success_beep()
+        time.sleep(2)
+        led_success.off()
+
+    shutil.chown(fn, file_config["user"], file_config.get("group", None))
+    os.chmod(fn, file_config["mode"])
+
+s = serial.Serial(**serial_config)
+
+count = 0
+buf = b''
+ty = None
+start_time = None
+last_data_ts = None
+
+led_receiving.off()
+led_success.off()
+led_failure.off()
+
+while True:
+    data = s.read(file_config["chunksize"])
+    if data:
+        last_data_ts = time.monotonic()
+    buf += data
+
+    timed_out = not data and last_data_ts is not None and (
+        (time.monotonic() - last_data_ts) >= overall_timeout
+    )
+
+    if buf and (timed_out or data_complete(buf, ty)):
+
+        logging.info(f"finished. Received: {ty}. Converting...")
+        led_receiving.on()
+
+        image_data, buf = get_first_image(buf, ty)
+        count = 0
+        do_conversion(image_data, ty, start_time)
+        start_time = None
+
+    # zero byte comes in when the scope is shut off
+    elif data and data != b'\0':
+        if not start_time:
+            start_time = time.localtime()
+            logging.info("receive started")
+            ty = None
+
+        len_before = len(buf) - len(data)
+        len_after = len(buf)
+
+        if ty is None:
+            ty = identify_type(buf)
+
+        if (len_after % 1024) < (len_before % 1024):
+            logging.info(f"have {len(buf)} bytes")
+
+        if not count:
+            start_beep()
+        if count % 2 == 0:
+            led_receiving.on()
+        else:
+            led_receiving.off()
+        count += 1
+
+    elif data == b'\0':
+        logging.info("rejecting shutdown transient")
+        buf = buf[:-1]
+        start_time = None

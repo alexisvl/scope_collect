@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect oscilloscope screenshots
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /share/bin/scope_collect
+
+[Install]
+WantedBy=multi-user.target
