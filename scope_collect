@@ -78,8 +78,8 @@ serial_config = {
 
 file_config = {
     "path": "/share/scope",
-    "file_pre": "scope-%Y%m%d-%H%M%S", # will prefix with file type
-    "file_post": "scope-%Y%m%d-%H%M%S", # only bitmaps converted
+    "file_pre": "scope-%Y%m%d-%H%M%S", # will suffix with file type
+    "file_post": "scope-%Y%m%d-%H%M%S", # will suffix with file type
     "convert_to": "png", # File extension, passed to imagemagick to guess the format
     "chunksize": 128,
     "user": "alex",
