@@ -39,10 +39,13 @@ import pwd
 
 logging.getLogger().setLevel(logging.DEBUG)
 
-# We can't parse the TIFF directly to get its size (I don't think), but this
+# We can't parse the TIFF directly to get its size (I don't think*), but this
 # scope usually (see next constant) ends them with this string.
 #
 # The TIFF format DOES NOT GUARANTEE THIS, but this scope does it.
+#
+# * Yes, I know BMP does include the actual file size in bytes in the header.
+# The scope firmware emits zero for that.
 TIFF_TAIL = b"TIFF Driver 1.0\0"
 
 # If emitting screenshots in rapid succession, sometimes the tail is omitted.
@@ -181,7 +184,7 @@ def do_conversion(image_data, ty, start_time):
 
     fn_post = os.path.join(
         os.path.expandvars(file_config["path"]),
-        time.strftime(file_config["file_pre"], start_time)
+        time.strftime(file_config["file_post"], start_time)
             + "." + file_config["convert_to"]
     )
 
